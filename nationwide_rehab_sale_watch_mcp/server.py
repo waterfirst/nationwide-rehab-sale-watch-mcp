@@ -42,6 +42,12 @@ INTEREST_MAP = {
     "equipment": ["기계", "설비", "장비", "서버", "전자기기", "사무기기", "비품"],
     "real_estate": ["부동산", "공장", "토지", "건물"],
 }
+MODEL_PATTERNS = [
+    r"\b[A-Z]{2,}[A-Z0-9\-]{2,}_[A-Z0-9]+\b",
+    r"\b(?=[A-Za-z0-9-]*[A-Za-z])(?=[A-Za-z0-9-]*\d)[A-Za-z0-9]{2,}-[A-Za-z0-9]{3,}\b",
+    r"\bM[1234]\b",
+    r"\bRTX\s?[0-9]{3,4}\b",
+]
 
 mcp = FastMCP("nationwide-rehab-sale-watch")
 
@@ -206,6 +212,69 @@ def _interleave_by_court(items: list[dict[str, Any]], courts: list[str]) -> list
     return merged
 
 
+def _extract_model_candidates(text: str) -> list[str]:
+    found: list[str] = []
+    for pattern in MODEL_PATTERNS:
+        for match in re.findall(pattern, text, flags=re.I):
+            cleaned = _clean(match.strip(" .,:;()[]"))
+            if cleaned and cleaned not in found:
+                found.append(cleaned)
+    return found[:8]
+
+
+def _infer_asset_type(text: str) -> str:
+    low = text.lower()
+    rules = [
+        ("아이폰", "아이폰"),
+        ("iphone", "아이폰"),
+        ("아이패드", "아이패드"),
+        ("ipad", "아이패드"),
+        ("맥북", "맥북"),
+        ("macbook", "맥북"),
+        ("맥미니", "맥미니"),
+        ("mac mini", "맥미니"),
+        ("imac", "아이맥"),
+        ("아이맥", "아이맥"),
+        ("노트북", "노트북"),
+        ("laptop", "노트북"),
+        ("서버", "서버"),
+        ("전자기기", "전자기기"),
+        ("비품", "비품"),
+        ("설비", "설비"),
+        ("기계", "기계"),
+        ("장비", "장비"),
+        ("부동산", "부동산"),
+        ("토지", "토지"),
+        ("건물", "건물"),
+        ("공장", "공장"),
+    ]
+    for key, value in rules:
+        if key in low:
+            return value
+    return "미상"
+
+
+def _classify_priority(asset_type: str, text: str, matched: list[str]) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+    low = text.lower()
+    priority = "watch"
+    if asset_type in {"맥북", "아이패드", "아이폰", "맥미니", "아이맥", "노트북"}:
+        reasons.append(f"{asset_type} 직접 키워드")
+        priority = "high"
+    if any(x in low for x in ["apple", "애플", "macbook", "iphone", "ipad"]):
+        reasons.append("Apple 계열 단서")
+        priority = "high"
+    if any(x in low for x in ["서버", "전자기기", "비품", "기계", "설비", "장비"]) and priority != "high":
+        reasons.append("재판매 가능 물품 단서")
+        priority = "medium"
+    if any(x in low for x in ["부동산", "토지", "건물", "공장"]) and priority == "watch":
+        reasons.append("부동산/공장 자산")
+        priority = "medium"
+    if matched and not reasons:
+        reasons.append("관심 키워드 일치")
+    return priority, reasons
+
+
 def _score_candidate(item: dict[str, Any], keywords: list[str], interests: Optional[list[str]] = None) -> dict[str, Any]:
     text = (item["title"] + " " + item["agency"]).lower()
     matched = [kw for kw in keywords if kw.lower() in text]
@@ -217,11 +286,42 @@ def _score_candidate(item: dict[str, Any], keywords: list[str], interests: Optio
         score += 1
     if "real_estate" in selected and any(x in text for x in ["부동산", "공장", "토지", "건물"]):
         score += 1
+    asset_type = _infer_asset_type(text)
+    model_candidates = _extract_model_candidates(item["title"] + " " + item["agency"])
+    priority, reasons = _classify_priority(asset_type, text, matched)
+    if model_candidates:
+        score += 1
+        reasons.append(f"모델 단서 {model_candidates[0]}")
     return {
         **item,
+        "asset_type": asset_type,
+        "model_candidates": model_candidates,
         "matched_keywords": matched,
+        "priority": priority,
+        "reasons": reasons,
         "score": score,
     }
+
+
+def _enrich_candidate_detail(item: dict[str, Any]) -> dict[str, Any]:
+    url = item.get("url")
+    if not url:
+        return item
+    try:
+        detail = _parse_detail(_fetch_html(url), fallback_url=url)
+        body = detail.get("body_excerpt", "")
+        if item.get("asset_type") == "미상":
+            item["asset_type"] = _infer_asset_type(body)
+        extra_models = _extract_model_candidates(body)
+        if extra_models:
+            merged = list(dict.fromkeys((item.get("model_candidates") or []) + extra_models))
+            item["model_candidates"] = merged[:8]
+        item["written_at"] = detail.get("written_at", "")
+        item["expires_at"] = detail.get("expires_at", "")
+        item["phone"] = detail.get("phone", "")
+    except Exception:
+        pass
+    return item
 
 
 @mcp.tool()
@@ -327,8 +427,9 @@ def scan_sale_candidates(
     for item in items:
         profiled = _score_candidate(item, keywords, interests=interests or ["notebook", "apple", "equipment", "real_estate"])
         if profiled["score"] > 0:
-            ranked.append(profiled)
-    ranked.sort(key=lambda x: (-x["score"], x["court_name"], x["title"]))
+            ranked.append(_enrich_candidate_detail(profiled))
+    priority_order = {"high": 0, "medium": 1, "watch": 2}
+    ranked.sort(key=lambda x: (priority_order.get(x.get("priority", "watch"), 9), -x["score"], x["court_name"], x["title"]))
     ranked = ranked[: max(1, min(limit, 100))]
     return {
         "courts": selected,
