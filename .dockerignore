@@ -1,0 +1,11 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+pytest-of-root
+records/*.db*
+web/node_modules
+web/dist
+tests

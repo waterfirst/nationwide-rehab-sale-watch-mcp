@@ -28,6 +28,15 @@
 
 ## 빠른 실행
 
+### Docker Compose (운영 권장)
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+```
+
+브라우저에서 `http://127.0.0.1:8010`을 열면 됩니다. `web`과 `scanner` 서비스가 하나의 SQLite 볼륨을 공유하며, 기본 6시간마다 전국 공고를 다시 감지합니다.
+
 ### Linux / macOS
 
 ```bash
@@ -153,7 +162,9 @@ export REHAB_WATCH_PORT=8010
 
 ## 자동화 권장
 
-웹 API의 `POST /api/scans`를 cron, systemd timer 또는 사내 스케줄러에서 호출합니다. 짧은 주기의 과도한 요청은 피하고, 법원 공개 서비스의 이용정책과 서버 부하를 존중하세요.
+Docker Compose의 `scanner`는 기본 360분 주기로 즉시 1회 수집 후 반복합니다. `.env`의 `REHAB_WATCH_SCAN_INTERVAL_MINUTES`와 `REHAB_WATCH_SCAN_MAX_PAGES`로 조정할 수 있으며, 지나친 요청을 막기 위해 15분~24시간, 1~10페이지 범위로 제한합니다.
+
+별도 운영 환경에서는 웹 API의 `POST /api/scans`를 cron, systemd timer 또는 사내 스케줄러에서 호출해도 됩니다. 짧은 주기의 과도한 요청은 피하고, 법원 공개 서비스의 이용정책과 서버 부하를 존중하세요.
 
 권장 시작점:
 

@@ -1,0 +1,31 @@
+services:
+  web:
+    build: .
+    image: rehab-resale-radar:latest
+    restart: unless-stopped
+    ports:
+      - "${REHAB_WATCH_PORT:-8010}:8010"
+    environment:
+      REHAB_WATCH_DB_PATH: /data/rehab_watch.db
+      REHAB_WATCH_HOST: 0.0.0.0
+      REHAB_WATCH_PORT: 8010
+      REHAB_WATCH_CORS_ORIGINS: "${REHAB_WATCH_CORS_ORIGINS:-http://localhost:8010}"
+    volumes:
+      - rehab-watch-data:/data
+
+  scanner:
+    image: rehab-resale-radar:latest
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+    command: ["python", "-m", "nationwide_rehab_sale_watch_mcp.worker"]
+    environment:
+      REHAB_WATCH_DB_PATH: /data/rehab_watch.db
+      REHAB_WATCH_SCAN_INTERVAL_MINUTES: "${REHAB_WATCH_SCAN_INTERVAL_MINUTES:-360}"
+      REHAB_WATCH_SCAN_MAX_PAGES: "${REHAB_WATCH_SCAN_MAX_PAGES:-2}"
+    volumes:
+      - rehab-watch-data:/data
+
+volumes:
+  rehab-watch-data:
