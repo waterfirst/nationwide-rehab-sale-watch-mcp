@@ -2,3 +2,10 @@
 __pycache__/
 *.pyc
 records/last_seen.json
+records/*.db
+records/*.db-shm
+records/*.db-wal
+web/node_modules/
+web/dist/
+.pytest_cache/
+pytest-of-root/

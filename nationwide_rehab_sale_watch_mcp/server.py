@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import json
 import re
-from pathlib import Path
+import time
 from typing import Any, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from .pricing import calculate_valuation
+from .storage import WatchStore, utc_now
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -34,12 +38,12 @@ COURTS: dict[str, dict[str, str]] = {
     "djb": {"name": "대전회생법원", "base_url": "https://djb.scourt.go.kr"},
     "gjb": {"name": "광주회생법원", "base_url": "https://gjb.scourt.go.kr"},
 }
-STATE_PATH = Path("/home/waterfirst/.codex/mcp_servers/nationwide-rehab-sale-watch/records/last_seen.json")
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 INTEREST_MAP = {
     "notebook": ["노트북", "laptop", "맥북", "macbook", "컴퓨터", "pc"],
     "apple": ["애플", "apple", "아이폰", "iphone", "아이패드", "ipad", "맥북", "macbook", "맥미니", "imac"],
     "equipment": ["기계", "설비", "장비", "서버", "전자기기", "사무기기", "비품"],
+    "jewelry": ["귀금속", "금", "은", "다이아몬드", "보석", "주얼리", "시계", "순금"],
     "real_estate": ["부동산", "공장", "토지", "건물"],
 }
 MODEL_PATTERNS = [
@@ -50,12 +54,27 @@ MODEL_PATTERNS = [
 ]
 
 mcp = FastMCP("nationwide-rehab-sale-watch")
+store = WatchStore()
+
+_HTTP = requests.Session()
+_HTTP.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "ko-KR,ko;q=0.9"})
+_HTTP.mount(
+    "https://",
+    HTTPAdapter(
+        max_retries=Retry(
+            total=2,
+            connect=2,
+            read=2,
+            backoff_factor=0.4,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+        )
+    ),
+)
 
 
 def _session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT})
-    return s
+    return _HTTP
 
 
 def _clean(text: str) -> str:
@@ -72,10 +91,19 @@ def _court_cfg(court: str) -> dict[str, str]:
 
 
 def _fetch_html(url: str) -> str:
+    _validate_court_url(url)
     r = _session().get(url, timeout=25)
     r.raise_for_status()
-    r.encoding = "euc-kr"
+    if not r.encoding or r.encoding.lower() in {"iso-8859-1", "ascii"}:
+        r.encoding = r.apparent_encoding or "euc-kr"
     return r.text
+
+
+def _validate_court_url(url: str) -> None:
+    parsed = urlparse(url)
+    allowed_hosts = {urlparse(cfg["base_url"]).hostname for cfg in COURTS.values()}
+    if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
+        raise ValueError("지원되는 회생법원 HTTPS 주소만 조회할 수 있습니다.")
 
 
 def _extract_seq_id(url: str | None) -> Optional[str]:
@@ -140,20 +168,6 @@ def _parse_detail(html: str, fallback_url: str | None = None) -> dict[str, Any]:
     }
 
 
-def _load_state() -> dict[str, Any]:
-    if not STATE_PATH.exists():
-        return {"seen_by_court": {}}
-    try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"seen_by_court": {}}
-
-
-def _save_state(payload: dict[str, Any]) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def _normalize_courts(courts: Optional[list[str]]) -> list[str]:
     if not courts:
         return list(COURTS.keys())
@@ -167,25 +181,50 @@ def _normalize_courts(courts: Optional[list[str]]) -> list[str]:
     return values
 
 
-def _collect(courts: list[str], max_pages: int = 2, keyword: Optional[str] = None) -> list[dict[str, Any]]:
+def _collect_with_diagnostics(
+    courts: list[str],
+    max_pages: int = 2,
+    keyword: Optional[str] = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     collected: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    max_pages = max(1, min(int(max_pages), 10))
     for court in courts:
         cfg = _court_cfg(court)
-        for page in range(1, max_pages + 1):
-            url = cfg["list_url"] if page == 1 else f"{cfg['list_url']}?pageIndex={page}"
-            rows = _parse_list(court, _fetch_html(url))
-            if not rows:
-                break
-            if keyword:
-                key = keyword.lower()
-                rows = [r for r in rows if key in (r["title"] + " " + r["agency"]).lower()]
-            collected.extend(rows)
-    return collected
+        started = time.monotonic()
+        court_rows: list[dict[str, Any]] = []
+        try:
+            for page in range(1, max_pages + 1):
+                url = cfg["list_url"] if page == 1 else f"{cfg['list_url']}?pageIndex={page}"
+                rows = _parse_list(court, _fetch_html(url))
+                if not rows:
+                    break
+                if keyword:
+                    key = keyword.lower()
+                    rows = [r for r in rows if key in (r["title"] + " " + r["agency"]).lower()]
+                court_rows.extend(rows)
+            store.record_source_health(
+                court,
+                ok=True,
+                latency_ms=round((time.monotonic() - started) * 1000),
+                rows_seen=len(court_rows),
+            )
+            collected.extend(court_rows)
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            errors.append({"court_code": court, "message": message})
+            store.record_source_health(
+                court,
+                ok=False,
+                latency_ms=round((time.monotonic() - started) * 1000),
+                error=message,
+            )
+    return collected, errors
 
 
 def _interests_to_keywords(interests: Optional[list[str]]) -> list[str]:
     if not interests:
-        interests = ["notebook", "apple", "equipment", "real_estate"]
+        interests = ["notebook", "apple", "equipment", "jewelry", "real_estate"]
     keywords: list[str] = []
     for interest in interests:
         for kw in INTEREST_MAP.get(interest, []):
@@ -238,6 +277,10 @@ def _infer_asset_type(text: str) -> str:
         ("노트북", "노트북"),
         ("laptop", "노트북"),
         ("서버", "서버"),
+        ("다이아몬드", "다이아몬드"),
+        ("귀금속", "귀금속"),
+        ("순금", "귀금속"),
+        ("시계", "시계"),
         ("전자기기", "전자기기"),
         ("비품", "비품"),
         ("설비", "설비"),
@@ -267,6 +310,9 @@ def _classify_priority(asset_type: str, text: str, matched: list[str]) -> tuple[
     if any(x in low for x in ["서버", "전자기기", "비품", "기계", "설비", "장비"]) and priority != "high":
         reasons.append("재판매 가능 물품 단서")
         priority = "medium"
+    if asset_type in {"귀금속", "다이아몬드", "시계"}:
+        reasons.append(f"{asset_type} 시세 비교 가능")
+        priority = "high"
     if any(x in low for x in ["부동산", "토지", "건물", "공장"]) and priority == "watch":
         reasons.append("부동산/공장 자산")
         priority = "medium"
@@ -284,6 +330,8 @@ def _score_candidate(item: dict[str, Any], keywords: list[str], interests: Optio
         score += 2
     if "equipment" in selected and any(x in text for x in ["설비", "기계", "장비", "서버", "전자기기", "사무기기", "비품"]):
         score += 1
+    if "jewelry" in selected and any(x in text for x in ["귀금속", "다이아몬드", "보석", "순금", "시계"]):
+        score += 2
     if "real_estate" in selected and any(x in text for x in ["부동산", "공장", "토지", "건물"]):
         score += 1
     asset_type = _infer_asset_type(text)
@@ -324,6 +372,83 @@ def _enrich_candidate_detail(item: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def run_persistent_scan(
+    courts: Optional[list[str]] = None,
+    *,
+    interests: Optional[list[str]] = None,
+    max_pages: int = 2,
+    enrich_details: bool = False,
+) -> dict[str, Any]:
+    """Collect each source independently and durably upsert every observed notice."""
+    selected = _normalize_courts(courts)
+    run_id = store.start_scan(selected)
+    observed_at = utc_now()
+    keywords = _interests_to_keywords(interests)
+    items, errors = _collect_with_diagnostics(selected, max_pages=max_pages)
+    candidates: list[dict[str, Any]] = []
+    fresh_items: list[dict[str, Any]] = []
+    new_count = 0
+    try:
+        for item in items:
+            profiled = _score_candidate(
+                item,
+                keywords,
+                interests=interests or ["notebook", "apple", "equipment", "jewelry"],
+            )
+            if enrich_details and profiled["score"] > 0:
+                profiled = _enrich_candidate_detail(profiled)
+            listing_id, created = store.upsert_listing(profiled, observed_at=observed_at)
+            profiled["listing_id"] = listing_id
+            profiled["is_new"] = created
+            new_count += int(created)
+            if created:
+                fresh_items.append(profiled)
+            if profiled["score"] > 0:
+                candidates.append(profiled)
+        status = "success" if not errors else ("partial" if items else "failed")
+        store.finish_scan(
+            run_id,
+            status=status,
+            rows_seen=len(items),
+            new_count=new_count,
+            candidate_count=len(candidates),
+            errors=errors,
+        )
+    except Exception as exc:
+        errors.append({"court_code": "storage", "message": f"{type(exc).__name__}: {exc}"})
+        store.finish_scan(
+            run_id,
+            status="failed",
+            rows_seen=len(items),
+            new_count=new_count,
+            candidate_count=len(candidates),
+            errors=errors,
+        )
+        raise
+    priority_order = {"high": 0, "medium": 1, "watch": 2}
+    candidates.sort(
+        key=lambda x: (
+            priority_order.get(x.get("priority", "watch"), 9),
+            -x.get("score", 0),
+            x.get("court_name", ""),
+            x.get("title", ""),
+        )
+    )
+    return {
+        "run_id": run_id,
+        "status": status,
+        "courts": selected,
+        "rows_seen": len(items),
+        "new_count": new_count,
+        "candidate_count": len(candidates),
+        "items": candidates,
+        "new_items": fresh_items,
+        "errors": errors,
+        "observed_at": observed_at,
+        "database": str(store.path),
+    }
+
+
 @mcp.tool()
 def list_courts() -> dict[str, Any]:
     """지원하는 회생법원 코드 목록을 반환한다."""
@@ -342,7 +467,7 @@ def list_sale_notices(
 ) -> dict[str, Any]:
     """여러 회생법원의 최신 매각 공고를 통합 조회한다."""
     selected = _normalize_courts(courts)
-    items = _collect(selected, max_pages=max_pages, keyword=keyword)
+    items, errors = _collect_with_diagnostics(selected, max_pages=max_pages, keyword=keyword)
     if len(selected) > 1:
         items = _interleave_by_court(items, selected)
     items = items[: max(1, min(limit, 100))]
@@ -350,6 +475,8 @@ def list_sale_notices(
         "courts": selected,
         "count": len(items),
         "items": items,
+        "status": "success" if not errors else ("partial" if items else "failed"),
+        "errors": errors,
         "disclaimer": "공식 공개 공고 조회 결과. 법률자문 아님.",
     }
 
@@ -387,27 +514,20 @@ def list_new_sale_notices(
     keyword: Optional[str] = None,
     max_pages: int = 2,
 ) -> dict[str, Any]:
-    """직전 스냅샷 대비 신규 공고만 조회하고 상태를 갱신한다."""
-    selected = _normalize_courts(courts)
-    items = _collect(selected, max_pages=max_pages, keyword=keyword)
-    state = _load_state()
-    seen_by_court = state.get("seen_by_court", {})
-    fresh: list[dict[str, Any]] = []
-    next_seen: dict[str, list[str]] = dict(seen_by_court)
-    for court in selected:
-        court_items = [x for x in items if x["court_code"] == court and x.get("seq_id")]
-        seen = set(seen_by_court.get(court, []))
-        fresh.extend([x for x in court_items if x["seq_id"] not in seen])
-        next_seen[court] = [x["seq_id"] for x in court_items if x.get("seq_id")]
-    _save_state({"seen_by_court": next_seen})
-    if len(selected) > 1:
-        fresh = _interleave_by_court(fresh, selected)
+    """SQLite 전체 이력 대비 신규 공고만 반환하고 수집 이력을 남긴다."""
+    result = run_persistent_scan(courts, max_pages=max_pages)
+    fresh = result["new_items"]
+    if keyword:
+        key = keyword.lower()
+        fresh = [item for item in fresh if key in (item["title"] + " " + item["agency"]).lower()]
     fresh = fresh[: max(1, min(limit, 100))]
     return {
-        "courts": selected,
+        "courts": result["courts"],
         "count": len(fresh),
         "items": fresh,
-        "state_path": str(STATE_PATH),
+        "scan_status": result["status"],
+        "errors": result["errors"],
+        "database": str(store.path),
         "disclaimer": "공식 공개 공고 조회 결과. 법률자문 아님.",
     }
 
@@ -419,22 +539,68 @@ def scan_sale_candidates(
     interests: Optional[list[str]] = None,
     max_pages: int = 2,
 ) -> dict[str, Any]:
-    """관심 품목 중심으로 전국 회생법원 공고 후보를 추린다."""
-    selected = _normalize_courts(courts)
-    keywords = _interests_to_keywords(interests)
-    items = _collect(selected, max_pages=max_pages)
-    ranked = []
-    for item in items:
-        profiled = _score_candidate(item, keywords, interests=interests or ["notebook", "apple", "equipment", "real_estate"])
-        if profiled["score"] > 0:
-            ranked.append(_enrich_candidate_detail(profiled))
-    priority_order = {"high": 0, "medium": 1, "watch": 2}
-    ranked.sort(key=lambda x: (priority_order.get(x.get("priority", "watch"), 9), -x["score"], x["court_name"], x["title"]))
-    ranked = ranked[: max(1, min(limit, 100))]
+    """관심 품목 후보를 선별하고 SQLite에 누적 저장한다."""
+    result = run_persistent_scan(
+        courts,
+        interests=interests,
+        max_pages=max_pages,
+        enrich_details=True,
+    )
+    ranked = result["items"][: max(1, min(limit, 100))]
     return {
-        "courts": selected,
-        "interests": interests or ["notebook", "apple", "equipment", "real_estate"],
+        "courts": result["courts"],
+        "interests": interests or ["notebook", "apple", "equipment", "jewelry", "real_estate"],
         "count": len(ranked),
         "items": ranked,
+        "scan_status": result["status"],
+        "new_count": result["new_count"],
+        "rows_seen": result["rows_seen"],
+        "errors": result["errors"],
+        "database": str(store.path),
         "disclaimer": "제목/기관 기준 1차 자동선별 결과. 입찰 전 원문 확인 필요.",
     }
+
+
+@mcp.tool()
+def get_watch_dashboard(limit: int = 50) -> dict[str, Any]:
+    """누적된 공고, 수집 상태, 시세 분석 요약을 반환한다."""
+    payload = store.dashboard()
+    payload["listings"] = payload["listings"][: max(1, min(limit, 200))]
+    payload["database"] = str(store.path)
+    return payload
+
+
+@mcp.tool()
+def recommend_bid_price(
+    market_prices: list[int],
+    condition_ratio: float = 0.92,
+    negotiation_ratio: float = 0.96,
+    selling_fee_ratio: float = 0.04,
+    acquisition_fee_ratio: float = 0.02,
+    repair_cost: int = 50_000,
+    logistics_cost: int = 30_000,
+    risk_ratio: float = 0.10,
+    target_margin_ratio: float = 0.18,
+) -> dict[str, Any]:
+    """사용자가 확인한 중고 시세로 최대 입찰가와 권장 판매가를 추정한다."""
+    result = calculate_valuation(
+        market_prices,
+        {
+            "condition_ratio": condition_ratio,
+            "negotiation_ratio": negotiation_ratio,
+            "selling_fee_ratio": selling_fee_ratio,
+            "acquisition_fee_ratio": acquisition_fee_ratio,
+            "repair_cost": repair_cost,
+            "logistics_cost": logistics_cost,
+            "risk_ratio": risk_ratio,
+            "target_margin_ratio": target_margin_ratio,
+        },
+    )
+    return {
+        **result,
+        "disclaimer": "입력한 시세와 가정에 따른 의사결정 보조값입니다. 실물·권리·세금·입찰조건은 별도로 확인하세요.",
+    }
+
+
+if __name__ == "__main__":
+    mcp.run()
