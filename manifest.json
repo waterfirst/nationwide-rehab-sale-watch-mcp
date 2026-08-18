@@ -1,8 +1,8 @@
 {
   "name": "nationwide-rehab-sale-watch-mcp",
-  "version": "0.1.0",
-  "display_name": "전국 회생법원 매각 매물 조회 MCP",
-  "description": "서울·수원·부산·대구·대전·광주 회생법원 회생파산 자산매각 공고를 통합 조회하는 MCP 서버",
+  "version": "1.0.0",
+  "display_name": "리세일 레이더 — 전국 회생법원 매각 기회 분석",
+  "description": "전국 6개 회생법원 공고를 누적하고 중고 시세 근거로 최대 입찰가·권장 판매가를 추정하는 MCP+Web 서비스",
   "author": "OpenAI Codex for waterfirst",
   "license": "공식 공개 공고 조회용. 법률자문 아님.",
   "runtime": "python",
@@ -19,7 +19,9 @@
     "list_sale_notices",
     "get_sale_notice_detail",
     "list_new_sale_notices",
-    "scan_sale_candidates"
+    "scan_sale_candidates",
+    "get_watch_dashboard",
+    "recommend_bid_price"
   ],
   "source": "https://www.scourt.go.kr/"
 }

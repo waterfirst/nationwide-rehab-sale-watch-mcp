@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nationwide-rehab-sale-watch-mcp"
+version = "1.0.0"
+description = "Nationwide Korean rehabilitation court asset resale intelligence MCP and web dashboard"
+requires-python = ">=3.10"
+dependencies = [
+  "beautifulsoup4",
+  "fastapi>=0.116",
+  "mcp[cli]",
+  "requests",
+  "uvicorn[standard]>=0.35",
+]
+
+[tool.setuptools.packages.find]
+include = ["nationwide_rehab_sale_watch_mcp*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
